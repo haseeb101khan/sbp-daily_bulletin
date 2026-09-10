@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import mimetypes
 import re
 import sys
 import tempfile
@@ -9,6 +10,7 @@ import uuid
 from datetime import date
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +79,9 @@ def build_response_payload(
 
 class handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
+        if urlparse(self.path).path != "/api/generate":
+            return self.send_json({"ok": False, "error": "Not found."}, status=404)
+
         try:
             fields, files = self.parse_multipart()
             uploaded = files.get("excel_file")
@@ -95,7 +100,22 @@ class handler(BaseHTTPRequestHandler):
             self.send_json({"ok": False, "error": str(exc)}, status=400)
 
     def do_GET(self) -> None:
-        self.send_json({"ok": False, "error": "Use POST /api/generate."}, status=405)
+        path = urlparse(self.path).path
+
+        if path in {"/", "/index.html"}:
+            return self.send_file(ROOT / "index.html", "text/html; charset=utf-8")
+        if path.startswith("/static/"):
+            safe_name = Path(unquote(path.removeprefix("/static/"))).name
+            return self.send_file(ROOT / "static" / safe_name)
+        if path == "/data/Daily_Bulletin_Empty_Template.xlsx":
+            return self.send_file(
+                ROOT / "data" / "Daily_Bulletin_Empty_Template.xlsx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                download_name="Daily_Bulletin_Empty_Template.xlsx",
+            )
+        if path == "/api/generate":
+            return self.send_json({"ok": False, "error": "Use POST /api/generate."}, status=405)
+        return self.send_json({"ok": False, "error": "Not found."}, status=404)
 
     def parse_multipart(self) -> tuple[dict[str, str], dict[str, tuple[str, bytes]]]:
         content_type = self.headers.get("Content-Type", "")
@@ -150,3 +170,22 @@ class handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+    def send_file(self, path: Path, content_type: str | None = None, download_name: str | None = None) -> None:
+        resolved = path.resolve()
+        allowed_roots = [(ROOT / "static").resolve(), (ROOT / "data").resolve()]
+        allowed_files = {(ROOT / "index.html").resolve()}
+        if resolved not in allowed_files and not any(root == resolved or root in resolved.parents for root in allowed_roots):
+            return self.send_json({"ok": False, "error": "Not found."}, status=404)
+        if not resolved.exists() or not resolved.is_file():
+            return self.send_json({"ok": False, "error": "Not found."}, status=404)
+
+        payload = resolved.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type or mimetypes.guess_type(resolved.name)[0] or "application/octet-stream")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "public, max-age=300")
+        if download_name:
+            self.send_header("Content-Disposition", f'attachment; filename="{download_name}"')
+        self.end_headers()
+        self.wfile.write(payload)
