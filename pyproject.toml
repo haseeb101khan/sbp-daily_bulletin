@@ -1,2 +1,11 @@
+[project]
+name = "sbp-daily-bulletin"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "openpyxl==3.1.5",
+    "python-docx==1.2.0",
+]
+
 [tool.vercel]
 entrypoint = "api.generate:handler"
