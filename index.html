@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Daily Bulletin System</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="workspace" aria-labelledby="page-title">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">External Communications Department</p>
+            <h1 id="page-title">Daily Bulletin System</h1>
+          </div>
+          <a class="button secondary" href="/data/Daily_Bulletin_Empty_Template.xlsx" download="Daily_Bulletin_Empty_Template.xlsx">Open Empty Excel Template</a>
+        </header>
+
+        <form id="generate-form" class="panel">
+          <div class="form-grid">
+            <label>
+              Bulletin date
+              <input name="bulletin_date" type="text" placeholder="Thursday, September 10, 2026" />
+            </label>
+            <label>
+              Prepared for
+              <input name="prepared_for" type="text" value="SBP Management Forum" />
+            </label>
+          </div>
+
+          <label id="upload-zone" class="upload-zone" for="excel-file">
+            <span id="upload-badge" class="upload-badge">Uploaded</span>
+            <span class="upload-title">Upload completed Excel file</span>
+            <span id="file-name" class="upload-copy">Choose the filled template to generate a Word bulletin.</span>
+            <input id="excel-file" name="excel_file" type="file" accept=".xlsx" required />
+          </label>
+
+          <div class="actions">
+            <button id="generate-button" class="button primary" type="submit">Generate Report</button>
+            <p id="status" class="status" role="status"></p>
+          </div>
+        </form>
+
+        <section id="result" class="result" hidden>
+          <div>
+            <p class="eyebrow">Generated report</p>
+            <h2 id="result-title">Word bulletin is ready</h2>
+            <p id="result-summary"></p>
+          </div>
+          <div class="result-actions">
+            <a id="preview-link" class="button primary" href="#" target="_blank" rel="noopener">View Report</a>
+            <a id="download-link" class="button secondary" href="#">Download Word Report</a>
+          </div>
+        </section>
+
+        <section id="warnings" class="warnings" hidden>
+          <h2>Review notes</h2>
+          <ul id="warning-list"></ul>
+        </section>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
