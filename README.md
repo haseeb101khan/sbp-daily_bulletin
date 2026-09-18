@@ -5,8 +5,8 @@ This is the Vercel-ready preview version of the Excel-to-Word Daily Bulletin MVP
 ## Workflow
 
 1. Open the deployed Vercel site.
-2. Download the empty Excel template.
-3. Fill the `News Input` sheet.
+2. Download the empty news links template.
+3. Fill the `Sheet3` sheet using the ECD format: `Domain`, `Heading`, `Paper`, `Link`.
 4. Upload the completed `.xlsx`; the upload box turns green when the file is ready.
 5. Click **Generate Report**.
 6. Use **View Report** to review the bulletin in the browser.
@@ -28,7 +28,7 @@ vercel
 
 ## How This Version Works
 
-The static frontend is served from `index.html` and `static/`. The Python serverless function at `api/generate.py` receives the Excel upload, generates a preview HTML file and Word document in temporary storage, then returns both to the browser in one response.
+The static frontend is served from `index.html` and `static/`. The Python serverless function at `api/generate.py` receives the Excel upload, reads either the raw ECD links format (`Domain`, `Heading`, `Paper`, `Link`) or the enriched scraper output (`Domain`, `Source`, `Heading`, `Author`, `Content`, `Link`, `Date`, `Status`), generates a preview HTML file and Word document in temporary storage, then returns both to the browser in one response.
 
 `pyproject.toml` points Vercel at the Python entrypoint:
 

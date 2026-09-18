@@ -3,3 +3,4 @@ __pycache__/
 .vercel/
 generated/
 node_modules/
+*.inspect.ndjson

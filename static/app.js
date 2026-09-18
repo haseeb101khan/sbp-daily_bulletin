@@ -38,7 +38,7 @@ fileInput.addEventListener("change", () => {
   uploadZone.classList.toggle("has-file", hasFile);
   fileName.textContent = hasFile
     ? `File uploaded: ${fileInput.files[0].name}`
-    : "Choose the filled template to generate a Word bulletin.";
+    : "Choose the ECD links sheet with Domain, Heading, Paper, and Link columns.";
   statusLine.textContent = hasFile ? "Excel file uploaded and ready." : "";
   statusLine.classList.remove("error");
 });

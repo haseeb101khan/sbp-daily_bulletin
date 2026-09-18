@@ -12,6 +12,7 @@ from datetime import date
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable
+from urllib.parse import urlparse
 
 from docx import Document
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
@@ -31,15 +32,18 @@ DEFAULT_SECTIONS = [
 
 HEADER_ALIASES = {
     "include": ["include", "use", "selected"],
-    "section": ["section", "category"],
+    "section": ["section", "category", "domain"],
     "story_group": ["storygroup", "storytopic", "story", "topic"],
-    "headline": ["headline", "articleheadline", "newstitle", "title"],
-    "source": ["source", "newspaper", "publication"],
+    "headline": ["headline", "articleheadline", "newstitle", "title", "heading"],
+    "source": ["source", "newspaper", "publication", "paper"],
     "url": ["url", "link", "articlelink"],
     "article_text": ["articletext", "manualtext", "content", "body"],
+    "author": ["author", "byline", "writer"],
+    "date_text": ["date", "published", "publishdate", "articledate"],
     "language": ["language", "lang"],
     "priority": ["priority"],
     "notes": ["notes", "printreference", "reference"],
+    "status": ["status", "extractionstatus"],
 }
 
 BLUE = RGBColor(31, 111, 104)
@@ -55,11 +59,14 @@ class NewsItem:
     story_group: str
     headline: str
     source: str
+    author: str
     url: str
+    date_text: str
     article_text: str
     language: str
     priority: str
     notes: str
+    status: str
 
 
 class ParagraphCollector(HTMLParser):
@@ -67,7 +74,12 @@ class ParagraphCollector(HTMLParser):
         super().__init__()
         self.in_script = False
         self.in_style = False
+        self.in_title = False
+        self.in_heading = False
         self.in_paragraph = False
+        self.title_parts: list[str] = []
+        self.heading_parts: list[str] = []
+        self.headings: list[str] = []
         self.current: list[str] = []
         self.paragraphs: list[str] = []
 
@@ -77,6 +89,12 @@ class ParagraphCollector(HTMLParser):
             self.in_script = True
         elif tag == "style":
             self.in_style = True
+        elif tag == "title":
+            self.in_title = True
+            self.title_parts = []
+        elif tag in {"h1", "h2"}:
+            self.in_heading = True
+            self.heading_parts = []
         elif tag == "p":
             self.in_paragraph = True
             self.current = []
@@ -87,6 +105,14 @@ class ParagraphCollector(HTMLParser):
             self.in_script = False
         elif tag == "style":
             self.in_style = False
+        elif tag == "title":
+            self.in_title = False
+        elif tag in {"h1", "h2"} and self.in_heading:
+            text = clean_text(" ".join(self.heading_parts))
+            if len(text) >= 12:
+                self.headings.append(text)
+            self.in_heading = False
+            self.heading_parts = []
         elif tag == "p" and self.in_paragraph:
             text = clean_text(" ".join(self.current))
             if len(text) >= 45:
@@ -97,8 +123,20 @@ class ParagraphCollector(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self.in_script or self.in_style:
             return
+        if self.in_title:
+            self.title_parts.append(data)
+        if self.in_heading:
+            self.heading_parts.append(data)
         if self.in_paragraph:
             self.current.append(data)
+
+    def best_title(self) -> str:
+        for candidate in self.headings:
+            if candidate:
+                return candidate
+        title = clean_text(" ".join(self.title_parts))
+        title = re.split(r"\s+[|-]\s+", title)[0].strip()
+        return title
 
 
 def clean_text(value) -> str:
@@ -121,6 +159,30 @@ def first_alias_match(header_map: dict[str, int], field: str) -> int | None:
         if alias in header_map:
             return header_map[alias]
     return None
+
+
+def is_http_url(value: str) -> bool:
+    parsed = urlparse(value or "")
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def normalize_section_label(value: str) -> str:
+    text = clean_text(value)
+    upper = text.upper()
+    if "SBP" in upper:
+        return "SBP Related News / Press Release"
+    if "DOMESTIC" in upper:
+        return "Domestic News"
+    if "EDITORIAL" in upper or "OPINION" in upper or "ARTICLE" in upper:
+        return "Editorials / Opinion / Analysis"
+    if "FOREIGN" in upper or "INTERNATIONAL" in upper:
+        return "Foreign Media Updates"
+    return text or "Domestic News"
+
+
+def source_meta(item: "NewsItem") -> str:
+    parts = [part for part in [item.source, item.author, item.date_text] if part]
+    return " / ".join(parts) or "Unspecified source"
 
 
 def find_header_row(sheet) -> tuple[int, dict[str, int]]:
@@ -146,6 +208,7 @@ def read_news_items(excel_path: Path) -> tuple[list[NewsItem], list[str]]:
     header_row, columns = find_header_row(sheet)
     warnings: list[str] = []
     items: list[NewsItem] = []
+    last_section = ""
 
     def cell_text(row: int, field: str) -> str:
         col = columns.get(field)
@@ -162,29 +225,48 @@ def read_news_items(excel_path: Path) -> tuple[list[NewsItem], list[str]]:
         if include in {"no", "n", "false", "0", "skip", "skipped"}:
             continue
 
-        section = cell_text(row, "section") or "Domestic News"
+        raw_section = cell_text(row, "section")
+        if raw_section:
+            last_section = raw_section
+        section = normalize_section_label(raw_section or last_section)
         headline = cell_text(row, "headline")
         source = cell_text(row, "source") or "Unspecified source"
         story_group = cell_text(row, "story_group") or headline
         url = cell_text(row, "url")
+        author = cell_text(row, "author")
+        date_text = cell_text(row, "date_text")
         article_text = cell_text(row, "article_text")
         language = cell_text(row, "language") or "English"
-        priority = cell_text(row, "priority") or "Medium"
+        priority = cell_text(row, "priority")
         notes = cell_text(row, "notes")
+        status = cell_text(row, "status")
 
         if not headline and story_group:
             headline = story_group
-        if not headline:
-            warnings.append(f"Row {row}: skipped because Headline is empty.")
-            continue
 
-        if not article_text and url:
-            article_text, extraction_note = extract_article_from_url(url)
+        status_lower = status.lower()
+        if not article_text and status_lower and not status_lower.startswith("ok") and not status_lower.startswith("partial"):
+            article_text = "[Article content was not available in the uploaded scraper output. Please review this row before final circulation.]"
+            warnings.append(f"Row {row}: uploaded status is {status}.")
+        elif not article_text and is_http_url(url):
+            article_text, extraction_note, extracted_title = extract_article_from_url(url)
+            if not headline and extracted_title:
+                headline = extracted_title
             if extraction_note:
                 warnings.append(f"Row {row}: {extraction_note}")
+        elif not article_text and url and not is_http_url(url):
+            article_text = "[Article text was not provided and the Link cell is not a reachable web URL. Please paste the article text or a valid URL before final circulation.]"
+            warnings.append(f"Row {row}: Link is not a valid URL: {url}")
         elif not article_text:
             article_text = "[Article text was not provided. Add article text or a reachable URL before final circulation.]"
             warnings.append(f"Row {row}: no article text or URL was provided.")
+
+        if not headline:
+            headline = f"{source} article"
+            warnings.append(f"Row {row}: Headline is empty; used a placeholder headline.")
+
+        if not story_group:
+            story_group = headline
 
         items.append(
             NewsItem(
@@ -193,11 +275,14 @@ def read_news_items(excel_path: Path) -> tuple[list[NewsItem], list[str]]:
                 story_group=story_group or headline,
                 headline=headline,
                 source=source,
+                author=author,
                 url=url,
+                date_text=date_text,
                 article_text=article_text,
                 language=language,
                 priority=priority,
                 notes=notes,
+                status=status,
             )
         )
 
@@ -206,7 +291,7 @@ def read_news_items(excel_path: Path) -> tuple[list[NewsItem], list[str]]:
     return items, warnings
 
 
-def extract_article_from_url(url: str) -> tuple[str, str]:
+def extract_article_from_url(url: str) -> tuple[str, str, str]:
     try:
         request = urllib.request.Request(
             url,
@@ -223,13 +308,15 @@ def extract_article_from_url(url: str) -> tuple[str, str]:
         return (
             "[The app could not extract this article automatically. Please paste the article text in the Excel template.]",
             f"URL extraction failed for {url}: {exc}",
+            "",
         )
 
     collector = ParagraphCollector()
     collector.feed(markup)
+    extracted_title = collector.best_title()
     paragraphs = [p for p in collector.paragraphs if not is_boilerplate(p)]
     if paragraphs:
-        return "\n\n".join(paragraphs[:24]), ""
+        return "\n\n".join(paragraphs[:24]), "", extracted_title
 
     text = re.sub(r"(?is)<(script|style).*?</\1>", " ", markup)
     text = re.sub(r"(?s)<[^>]+>", " ", text)
@@ -238,8 +325,9 @@ def extract_article_from_url(url: str) -> tuple[str, str]:
         return (
             "[The app could not detect the article body. Please paste the article text in the Excel template.]",
             f"URL extraction returned too little text for {url}.",
+            extracted_title,
         )
-    return text[:6000], ""
+    return text[:6000], "", extracted_title
 
 
 def is_boilerplate(text: str) -> bool:
@@ -530,20 +618,24 @@ def add_article_body(doc: Document, grouped, anchors, links: LinkBuilder) -> Non
 
                 source = doc.add_paragraph()
                 set_para_spacing(source, after=5)
-                run = source.add_run(item.source)
+                run = source.add_run(source_meta(item))
                 set_run_font(run, size=10, bold=True, color=DARK_BLUE)
                 if item.priority:
                     run = source.add_run(f" | Priority: {item.priority}")
                     set_run_font(run, size=9.2, color=GRAY)
-                if item.url:
+                if is_http_url(item.url):
                     run = source.add_run(" | ")
                     set_run_font(run, size=9.2, color=GRAY)
                     links.external_link(source, "Original URL", item.url)
 
-                if item.notes:
+                status_note = ""
+                if item.status and item.status.lower() != "ok":
+                    status_note = f"Extraction status: {item.status}"
+                note_text = " | ".join(part for part in [item.notes, status_note] if part)
+                if note_text:
                     notes = doc.add_paragraph()
                     set_para_spacing(notes, after=5)
-                    run = notes.add_run(f"Note: {item.notes}")
+                    run = notes.add_run(f"Note: {note_text}")
                     set_run_font(run, size=9.2, italic=True, color=GRAY)
 
                 for body_paragraph in split_body(item.article_text):
@@ -798,7 +890,7 @@ def render_preview_html(items: list[NewsItem], grouped, report_date: str, prepar
         parts.append(f'<h3 id="section-{esc(slug(section_name, "section").lower())}">{esc(section_name)}</h3>')
         parts.append('<ol class="headlines">')
         for story_group, story_items in stories.items():
-            source_text = " / ".join(item.source for item in story_items)
+            source_text = " / ".join(source_meta(item) for item in story_items)
             anchor = anchors[(section_name, story_group)]
             parts.append(
                 f'<li><a href="#{esc(anchor)}">{esc(story_group)}</a><span class="sources">{esc(source_text)}</span></li>'
@@ -816,14 +908,18 @@ def render_preview_html(items: list[NewsItem], grouped, report_date: str, prepar
             for item in story_items:
                 article_class = ' class="urdu"' if item.language.lower() == "urdu" else ""
                 parts.append(f"<h4{article_class}>{esc(item.headline)}</h4>")
-                source_line = esc(item.source)
+                source_line = esc(source_meta(item))
                 if item.priority:
                     source_line += f" | Priority: {esc(item.priority)}"
-                if item.url:
+                if is_http_url(item.url):
                     source_line += f' | <a href="{esc(item.url)}" target="_blank" rel="noopener">Original URL</a>'
                 parts.append(f'<p class="source">{source_line}</p>')
-                if item.notes:
-                    parts.append(f'<p class="notes">Note: {esc(item.notes)}</p>')
+                status_note = ""
+                if item.status and item.status.lower() != "ok":
+                    status_note = f"Extraction status: {item.status}"
+                note_text = " | ".join(part for part in [item.notes, status_note] if part)
+                if note_text:
+                    parts.append(f'<p class="notes">Note: {esc(note_text)}</p>')
                 body_class = ' class="body urdu"' if item.language.lower() == "urdu" else ' class="body"'
                 parts.append(f"<div{body_class}>")
                 for paragraph in split_body(item.article_text):

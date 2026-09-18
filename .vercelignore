@@ -4,3 +4,5 @@ generated/
 node_modules/
 *.zip
 *.inspect.ndjson
+build_*.mjs
+test_*.py
