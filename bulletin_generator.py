@@ -1,18 +1,22 @@
 from __future__ import annotations
 
 import html
+import http.cookiejar
 import re
 import sys
+import time
 import urllib.error
 import urllib.request
 import zipfile
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import date
+from difflib import SequenceMatcher
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 from docx import Document
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
@@ -51,6 +55,23 @@ DARK_BLUE = RGBColor(20, 61, 58)
 NAVY = RGBColor(23, 50, 77)
 GRAY = RGBColor(83, 93, 104)
 
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/140.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+_BUSINESS_RECORDER_CANDIDATES: list["SyndicatedCandidate"] | None = None
+_DAWN_CANDIDATES: list["SyndicatedCandidate"] | None = None
+_AIB_CANDIDATES: list["SyndicatedCandidate"] | None = None
+_STREETINSIDER_CANDIDATES: list["SyndicatedCandidate"] | None = None
+
 
 @dataclass
 class NewsItem:
@@ -67,6 +88,13 @@ class NewsItem:
     priority: str
     notes: str
     status: str
+
+
+@dataclass(frozen=True)
+class SyndicatedCandidate:
+    title: str
+    url: str
+    source: str
 
 
 class ParagraphCollector(HTMLParser):
@@ -139,6 +167,29 @@ class ParagraphCollector(HTMLParser):
         return title
 
 
+class AnchorCollector(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.current_attrs: dict[str, str] | None = None
+        self.current_text: list[str] = []
+        self.anchors: list[tuple[dict[str, str], str]] = []
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag.lower() == "a" and self.current_attrs is None:
+            self.current_attrs = {str(key).lower(): str(value or "") for key, value in attrs}
+            self.current_text = []
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "a" and self.current_attrs is not None:
+            self.anchors.append((self.current_attrs, clean_text(" ".join(self.current_text))))
+            self.current_attrs = None
+            self.current_text = []
+
+    def handle_data(self, data: str) -> None:
+        if self.current_attrs is not None:
+            self.current_text.append(data)
+
+
 def clean_text(value) -> str:
     if value is None:
         return ""
@@ -164,6 +215,18 @@ def first_alias_match(header_map: dict[str, int], field: str) -> int | None:
 def is_http_url(value: str) -> bool:
     parsed = urlparse(value or "")
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def requires_ocr(value: str) -> bool:
+    parsed = urlparse(value or "")
+    path = parsed.path.lower()
+    query = parsed.query.lower()
+    extensions = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tif", ".tiff", ".pdf")
+    if path.endswith(extensions):
+        return True
+    return any(ext in query for ext in extensions) and any(
+        key in query for key in ("newssrc=", "image=", "img=")
+    )
 
 
 def normalize_section_label(value: str) -> str:
@@ -203,18 +266,78 @@ def find_header_row(sheet) -> tuple[int, dict[str, int]]:
 
 
 def read_news_items(excel_path: Path) -> tuple[list[NewsItem], list[str]]:
+    if getattr(extract_article_from_url, "__module__", "") == __name__:
+        reset_source_caches()
     workbook = load_workbook(excel_path, data_only=True)
     sheet = workbook["News Input"] if "News Input" in workbook.sheetnames else workbook.active
     header_row, columns = find_header_row(sheet)
     warnings: list[str] = []
     items: list[NewsItem] = []
     last_section = ""
+    extraction_results: dict[tuple[str, str, str], tuple[str, str, str]] = {}
 
     def cell_text(row: int, field: str) -> str:
         col = columns.get(field)
         if not col:
             return ""
         return clean_text(sheet.cell(row=row, column=col).value)
+
+    extraction_requests: dict[tuple[str, str, str], None] = {}
+    for row in range(header_row + 1, sheet.max_row + 1):
+        include = cell_text(row, "include").lower()
+        if include in {"no", "n", "false", "0", "skip", "skipped"}:
+            continue
+        article_text = cell_text(row, "article_text")
+        url = cell_text(row, "url")
+        if article_text or not is_http_url(url):
+            continue
+        headline = cell_text(row, "headline") or cell_text(row, "story_group")
+        source = cell_text(row, "source") or "Unspecified source"
+        extraction_requests[(url, headline, source)] = None
+
+    is_default_extractor = getattr(extract_article_from_url, "__module__", "") == __name__
+    has_reuters_request = any(
+        (urlparse(url).hostname or "").lower().endswith("reuters.com")
+        or source.lower() == "reuters"
+        for url, _, source in extraction_requests
+    )
+    if is_default_extractor and has_reuters_request:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            preload = [
+                pool.submit(provider)
+                for provider in (
+                    business_recorder_candidates,
+                    aib_candidates,
+                    streetinsider_candidates,
+                )
+            ]
+            for future in as_completed(preload):
+                try:
+                    future.result()
+                except Exception:
+                    pass
+
+    if extraction_requests:
+        with ThreadPoolExecutor(max_workers=min(8, len(extraction_requests))) as pool:
+            pending = {
+                pool.submit(
+                    extract_article_from_url,
+                    url,
+                    headline,
+                    source,
+                ): (url, headline, source)
+                for url, headline, source in extraction_requests
+            }
+            for future in as_completed(pending):
+                key = pending[future]
+                try:
+                    extraction_results[key] = future.result()
+                except Exception as exc:
+                    extraction_results[key] = (
+                        "[The app could not extract this article automatically. Please paste the article text in the Excel template.]",
+                        f"URL extraction failed for {key[0]}: {exc}",
+                        "",
+                    )
 
     for row in range(header_row + 1, sheet.max_row + 1):
         raw_values = [clean_text(sheet.cell(row=row, column=col).value) for col in range(1, sheet.max_column + 1)]
@@ -245,18 +368,29 @@ def read_news_items(excel_path: Path) -> tuple[list[NewsItem], list[str]]:
             headline = story_group
 
         status_lower = status.lower()
-        if not article_text and status_lower and not status_lower.startswith("ok") and not status_lower.startswith("partial"):
-            article_text = "[Article content was not available in the uploaded scraper output. Please review this row before final circulation.]"
-            warnings.append(f"Row {row}: uploaded status is {status}.")
-        elif not article_text and is_http_url(url):
-            article_text, extraction_note, extracted_title = extract_article_from_url(url)
+        if not article_text and is_http_url(url):
+            article_text, extraction_note, extracted_title = extraction_results[
+                (url, headline, source)
+            ]
             if not headline and extracted_title:
                 headline = extracted_title
             if extraction_note:
+                if status_lower:
+                    extraction_note = f"{extraction_note} Uploaded status: {status}."
                 warnings.append(f"Row {row}: {extraction_note}")
+            elif status_lower and not status_lower.startswith("ok") and not status_lower.startswith("partial"):
+                status = "recovered"
         elif not article_text and url and not is_http_url(url):
-            article_text = "[Article text was not provided and the Link cell is not a reachable web URL. Please paste the article text or a valid URL before final circulation.]"
-            warnings.append(f"Row {row}: Link is not a valid URL: {url}")
+            recovered = recover_article_without_url(headline, source)
+            if recovered:
+                article_text, recovered_title, recovered_url = recovered
+                url = recovered_url
+                if not headline and recovered_title:
+                    headline = recovered_title
+                status = "recovered"
+            else:
+                article_text = "[Article text was not provided and the Link cell is not a reachable web URL. Please paste the article text or a valid URL before final circulation.]"
+                warnings.append(f"Row {row}: Link is not a valid URL: {url}")
         elif not article_text:
             article_text = "[Article text was not provided. Add article text or a reachable URL before final circulation.]"
             warnings.append(f"Row {row}: no article text or URL was provided.")
@@ -291,43 +425,322 @@ def read_news_items(excel_path: Path) -> tuple[list[NewsItem], list[str]]:
     return items, warnings
 
 
-def extract_article_from_url(url: str) -> tuple[str, str, str]:
+def fetch_markup(
+    url: str,
+    *,
+    timeout: int = 15,
+    opener=None,
+) -> str:
+    request = urllib.request.Request(url, headers=BROWSER_HEADERS)
+    open_request = opener.open if opener is not None else urllib.request.urlopen
+    for attempt in range(2):
+        try:
+            with open_request(request, timeout=timeout) as response:
+                media_type = (response.headers.get_content_type() or "").lower()
+                if media_type.startswith("image/") or media_type == "application/pdf":
+                    raise ValueError("the URL points to an image or PDF and requires OCR")
+                charset = response.headers.get_content_charset() or "utf-8"
+                raw = response.read(1_500_000)
+            return raw.decode(charset, errors="replace")
+        except urllib.error.HTTPError as exc:
+            if attempt == 1 or exc.code not in {429, 500, 502, 503, 504}:
+                raise
+        except (urllib.error.URLError, TimeoutError):
+            if attempt == 1:
+                raise
+        time.sleep(0.35 * (attempt + 1))
+    raise RuntimeError(f"Failed to fetch {url}")
+
+
+def extract_from_markup(markup: str) -> tuple[str, str]:
+    collector = ParagraphCollector()
+    collector.feed(markup)
+    extracted_title = collector.best_title()
+    paragraphs = [paragraph for paragraph in collector.paragraphs if not is_boilerplate(paragraph)]
+    if paragraphs:
+        return "\n\n".join(paragraphs[:24]), extracted_title
+
+    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", markup)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return clean_text(text)[:6000], extracted_title
+
+
+def normalize_headline(value: str) -> str:
+    text = clean_text(value).lower()
+    text = re.sub(r"^(?:rpt-|update\s*\d*[-:]|forex-|analysis-)+\s*", "", text)
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def headline_score(expected: str, candidate: str) -> float:
+    left = normalize_headline(expected)
+    right = normalize_headline(candidate)
+    if not left or not right:
+        return 0.0
+    if left == right:
+        return 1.0
+    left_tokens = set(left.split())
+    right_tokens = set(right.split())
+    token_score = len(left_tokens & right_tokens) / max(1, len(left_tokens | right_tokens))
+    sequence_score = SequenceMatcher(None, left, right).ratio()
+    return max(token_score, sequence_score)
+
+
+def collect_anchors(markup: str) -> list[tuple[dict[str, str], str]]:
+    collector = AnchorCollector()
+    collector.feed(markup)
+    return collector.anchors
+
+
+def reset_source_caches() -> None:
+    global _BUSINESS_RECORDER_CANDIDATES
+    global _DAWN_CANDIDATES
+    global _AIB_CANDIDATES
+    global _STREETINSIDER_CANDIDATES
+    _BUSINESS_RECORDER_CANDIDATES = None
+    _DAWN_CANDIDATES = None
+    _AIB_CANDIDATES = None
+    _STREETINSIDER_CANDIDATES = None
+
+
+def business_recorder_candidates() -> list[SyndicatedCandidate]:
+    global _BUSINESS_RECORDER_CANDIDATES
+    if _BUSINESS_RECORDER_CANDIDATES is not None:
+        return _BUSINESS_RECORDER_CANDIDATES
+
+    candidates: list[SyndicatedCandidate] = []
     try:
-        request = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": "Mozilla/5.0 DailyNewsBulletinMVP/1.0",
-                "Accept": "text/html,application/xhtml+xml",
-            },
+        markup = fetch_markup("https://www.brecorder.com/latest-news/", timeout=18)
+        for attrs, title in collect_anchors(markup):
+            href = attrs.get("href", "")
+            if len(title) < 20 or "/news/" not in href:
+                continue
+            candidates.append(
+                SyndicatedCandidate(
+                    title=title,
+                    url=urljoin("https://www.brecorder.com/", href),
+                    source="Business Recorder",
+                )
+            )
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        pass
+    _BUSINESS_RECORDER_CANDIDATES = candidates
+    return candidates
+
+
+def dawn_candidates() -> list[SyndicatedCandidate]:
+    global _DAWN_CANDIDATES
+    if _DAWN_CANDIDATES is not None:
+        return _DAWN_CANDIDATES
+
+    candidates: list[SyndicatedCandidate] = []
+    try:
+        markup = fetch_markup("https://www.dawn.com/latest-news/", timeout=18)
+        for attrs, title in collect_anchors(markup):
+            href = attrs.get("href", "")
+            if len(title) < 20 or "/news/" not in href:
+                continue
+            candidates.append(
+                SyndicatedCandidate(
+                    title=title,
+                    url=urljoin("https://www.dawn.com/", href),
+                    source="Dawn",
+                )
+            )
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        pass
+    _DAWN_CANDIDATES = candidates
+    return candidates
+
+
+def aib_candidates() -> list[SyndicatedCandidate]:
+    global _AIB_CANDIDATES
+    if _AIB_CANDIDATES is not None:
+        return _AIB_CANDIDATES
+
+    page_urls = [
+        "https://www.aib.ie/fxcentre/i-want-to/read-news",
+        (
+            "https://www.aib.ie/fxcentre/i-want-to/"
+            "read-news.urncolonnewsmlcolonreuters_comcolon20260616colonnL1N42O03W"
+        ),
+    ]
+    candidates: list[SyndicatedCandidate] = []
+    seen: set[str] = set()
+
+    def add_page(markup: str) -> None:
+        for attrs, title in collect_anchors(markup):
+            selector = attrs.get("data-id", "")
+            if not selector.startswith("urncolonnewsmlcolonreuters_comcolon"):
+                continue
+            if selector in seen:
+                continue
+            seen.add(selector)
+            candidates.append(
+                SyndicatedCandidate(
+                    title=title,
+                    url=(
+                        "https://www.aib.ie/content/aib/fxcentre/i-want-to/"
+                        f"read-news.news-story.{selector}.html"
+                    ),
+                    source="AIB Reuters feed",
+                )
+            )
+
+    for page_url in page_urls:
+        try:
+            add_page(fetch_markup(page_url, timeout=18))
+        except (urllib.error.URLError, TimeoutError, ValueError):
+            continue
+    _AIB_CANDIDATES = candidates
+    return candidates
+
+
+def streetinsider_candidates() -> list[SyndicatedCandidate]:
+    global _STREETINSIDER_CANDIDATES
+    if _STREETINSIDER_CANDIDATES is not None:
+        return _STREETINSIDER_CANDIDATES
+
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar())
+    )
+    page_url = "https://www.streetinsider.com/Reuters/?classic=1"
+    candidates: list[SyndicatedCandidate] = []
+    seen: set[str] = set()
+
+    for _ in range(10):
+        try:
+            markup = fetch_markup(page_url, timeout=18, opener=opener)
+        except (urllib.error.URLError, TimeoutError, ValueError):
+            break
+        older_url = ""
+        for attrs, title in collect_anchors(markup):
+            href = html.unescape(attrs.get("href", ""))
+            if title.lower() == "view older stories" and "before_id=" in href:
+                older_url = urljoin("https://www.streetinsider.com/", href)
+            if not href.startswith("Reuters/") or not href.endswith(".html"):
+                continue
+            article_url = urljoin("https://www.streetinsider.com/", href)
+            if article_url in seen:
+                continue
+            seen.add(article_url)
+            candidates.append(
+                SyndicatedCandidate(
+                    title=title,
+                    url=article_url,
+                    source="StreetInsider Reuters feed",
+                )
+            )
+        if not older_url:
+            break
+        page_url = older_url + ("&classic=1" if "?" in older_url else "?classic=1")
+
+    _STREETINSIDER_CANDIDATES = candidates
+    return candidates
+
+
+def recover_reuters_article(headline: str) -> tuple[str, str] | None:
+    if not headline:
+        return None
+
+    providers = [
+        business_recorder_candidates,
+        aib_candidates,
+        streetinsider_candidates,
+    ]
+    for provider in providers:
+        candidates = provider()
+        if not candidates:
+            continue
+        ranked = sorted(
+            ((headline_score(headline, candidate.title), candidate) for candidate in candidates),
+            key=lambda pair: pair[0],
+            reverse=True,
         )
-        with urllib.request.urlopen(request, timeout=12) as response:
-            content_type = response.headers.get_content_charset() or "utf-8"
-            raw = response.read(1_500_000)
-        markup = raw.decode(content_type, errors="replace")
+        if not ranked or ranked[0][0] < 0.84:
+            continue
+        candidate = ranked[0][1]
+        try:
+            recovered_text, recovered_title = extract_from_markup(
+                fetch_markup(candidate.url, timeout=18)
+            )
+        except (urllib.error.URLError, TimeoutError, ValueError):
+            continue
+        if len(recovered_text) >= 200:
+            return recovered_text, recovered_title or candidate.title
+    return None
+
+
+def recover_article_without_url(
+    headline: str,
+    source: str,
+) -> tuple[str, str, str] | None:
+    source_lower = source.lower()
+    if "dawn" in source_lower:
+        candidates = dawn_candidates()
+    elif "business recorder" in source_lower:
+        candidates = business_recorder_candidates()
+    else:
+        return None
+
+    ranked = sorted(
+        ((headline_score(headline, candidate.title), candidate) for candidate in candidates),
+        key=lambda pair: pair[0],
+        reverse=True,
+    )
+    if not ranked or ranked[0][0] < 0.84:
+        return None
+    candidate = ranked[0][1]
+    try:
+        recovered_text, recovered_title = extract_from_markup(
+            fetch_markup(candidate.url, timeout=18)
+        )
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return None
+    if len(recovered_text) < 200:
+        return None
+    return recovered_text, recovered_title or candidate.title, candidate.url
+
+
+def extract_article_from_url(
+    url: str,
+    headline: str = "",
+    source: str = "",
+) -> tuple[str, str, str]:
+    if requires_ocr(url):
+        return (
+            "[This link contains an image or PDF scan. OCR or manually supplied article text is required.]",
+            f"OCR is required for {url}.",
+            "",
+        )
+    try:
+        markup = fetch_markup(url)
     except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+        host = (urlparse(url).hostname or "").lower()
+        if host == "reuters.com" or host.endswith(".reuters.com") or source.lower() == "reuters":
+            recovered = recover_reuters_article(headline)
+            if recovered:
+                recovered_text, recovered_title = recovered
+                return recovered_text, "", recovered_title
         return (
             "[The app could not extract this article automatically. Please paste the article text in the Excel template.]",
             f"URL extraction failed for {url}: {exc}",
             "",
         )
 
-    collector = ParagraphCollector()
-    collector.feed(markup)
-    extracted_title = collector.best_title()
-    paragraphs = [p for p in collector.paragraphs if not is_boilerplate(p)]
-    if paragraphs:
-        return "\n\n".join(paragraphs[:24]), "", extracted_title
-
-    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", markup)
-    text = re.sub(r"(?s)<[^>]+>", " ", text)
-    text = clean_text(text)
+    text, extracted_title = extract_from_markup(markup)
     if len(text) < 120:
+        host = (urlparse(url).hostname or "").lower()
+        if host == "reuters.com" or host.endswith(".reuters.com") or source.lower() == "reuters":
+            recovered = recover_reuters_article(headline)
+            if recovered:
+                recovered_text, recovered_title = recovered
+                return recovered_text, "", recovered_title
         return (
             "[The app could not detect the article body. Please paste the article text in the Excel template.]",
             f"URL extraction returned too little text for {url}.",
             extracted_title,
         )
-    return text[:6000], "", extracted_title
+    return text, "", extracted_title
 
 
 def is_boilerplate(text: str) -> bool:

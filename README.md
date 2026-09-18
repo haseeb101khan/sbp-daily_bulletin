@@ -30,6 +30,8 @@ vercel
 
 The static frontend is served from `index.html` and `static/`. The Python serverless function at `api/generate.py` receives the Excel upload, reads either the raw ECD links format (`Domain`, `Heading`, `Paper`, `Link`) or the enriched scraper output (`Domain`, `Source`, `Heading`, `Author`, `Content`, `Link`, `Date`, `Status`), generates a preview HTML file and Word document in temporary storage, then returns both to the browser in one response.
 
+Article downloads run concurrently with short retries for temporary newspaper-site failures. If Reuters blocks the direct server request, the app verifies the headline and recovers the same Reuters copy from public syndication pages. A malformed Dawn or Business Recorder link can also be recovered from the newspaper's current index when the headline match is unambiguous. Image-only scans and PDFs still require OCR or manually supplied article text.
+
 `pyproject.toml` points Vercel at the Python entrypoint:
 
 ```toml

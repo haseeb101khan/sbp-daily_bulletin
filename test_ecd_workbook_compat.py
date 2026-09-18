@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[2]
 REFERENCE = ROOT / "work" / "reference_ecd"
 
 
-def fake_extract(url: str) -> tuple[str, str, str]:
+def fake_extract(url: str, headline: str = "", source: str = "") -> tuple[str, str, str]:
     return (
         "This is test article text used to verify the raw ECD news links workbook without making network requests.",
         "",
@@ -18,9 +18,18 @@ def fake_extract(url: str) -> tuple[str, str, str]:
     )
 
 
+def fake_recover(headline: str, source: str) -> tuple[str, str, str]:
+    return (
+        "This is recovered test article text for a row whose Link cell did not contain a URL.",
+        headline or "Recovered test headline",
+        "https://example.com/recovered-article",
+    )
+
+
 def inspect(path: Path, monkeypatch_extract: bool = False) -> None:
     if monkeypatch_extract:
         bg.extract_article_from_url = fake_extract
+        bg.recover_article_without_url = fake_recover
     items, warnings = bg.read_news_items(path)
     sections = Counter(item.section for item in items)
     print(f"\n{path.name}")
